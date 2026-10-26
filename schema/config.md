@@ -118,6 +118,7 @@
 |`config.logging.database`|object|Log-store database configuration; enables request logging to a database backend.|
 |`config.logging.database.url`|string|Connection URL for the request log database. A postgres:// or postgresql:// URL uses Postgres; any other value is treated as a SQLite database.|
 |`config.logging.database.maxConnections`|integer|Maximum number of connections to open in this database's connection pool. Defaults to 5.<br>When the request log and config stores have matching database settings, they share one pool<br>with this limit.|
+|`config.logging.databaseRetention`|string|How long request logs are kept in the database. Older logs and their payloads are deleted at<br>startup, then every hour. Logs are kept forever when unset.|
 |`config.metrics`|object|Metrics configuration, including metric removal and custom fields.|
 |`config.metrics.remove`|[]string|Metric names to exclude from collection.|
 |`config.metrics.fields`|object|Custom fields to add to all metrics.|

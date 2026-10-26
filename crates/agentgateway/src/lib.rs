@@ -487,6 +487,11 @@ pub struct RawLogging {
 	format: Option<LoggingFormat>,
 	/// Log-store database configuration; enables request logging to a database backend.
 	database: Option<telemetry::log_store::Config>,
+	/// How long request logs are kept in the database. Older logs and their payloads are deleted at
+	/// startup, then every hour. Logs are kept forever when unset.
+	#[serde(default, with = "serde_dur_option")]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+	database_retention: Option<Duration>,
 }
 
 #[apply(schema_de!)]

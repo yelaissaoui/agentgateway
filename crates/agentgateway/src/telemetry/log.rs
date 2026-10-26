@@ -406,6 +406,9 @@ pub struct Config {
 	pub format: crate::LoggingFormat,
 	/// Optional request log database sink.
 	pub database: Option<crate::telemetry::log_store::Config>,
+	/// How long request logs are kept in the database sink.
+	#[serde(with = "crate::serdes::serde_dur_option")]
+	pub database_retention: Option<Duration>,
 }
 
 #[derive(serde::Serialize, Default, Clone, Debug)]

@@ -422,6 +422,10 @@ pub fn parse_config(
 		anyhow::bail!("config.logging.database.maxConnections must be greater than zero");
 	}
 	let logging_database = explicit_logging_database.or_else(|| database.clone());
+	let logging_database_retention = raw.logging.as_ref().and_then(|l| l.database_retention);
+	if logging_database_retention == Some(Duration::ZERO) {
+		anyhow::bail!("config.logging.databaseRetention must be greater than zero");
+	}
 
 	let mut storage_mode = raw.storage.clone().unwrap_or_default().mode;
 	if parse::<bool>("UI_READ_ONLY")?.unwrap_or(false) {
@@ -581,6 +585,7 @@ pub fn parse_config(
 				.and_then(|l| l.format.clone())
 				.unwrap_or_default(),
 			database: logging_database.clone(),
+			database_retention: logging_database_retention,
 				fields: logging_fields(raw.logging.as_ref().and_then(|f| f.fields.clone()))
 					.ctx("invalid config.logging.fields")?,
 				database_fields: Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -1472,6 +1477,45 @@ config:
 		assert!(
 			err.to_string().contains("invalid XDS_HEADER_*"),
 			"unexpected error: {err}"
+		);
+	}
+
+	#[test]
+	fn logging_database_retention() {
+		let _env_lock = lock_env();
+		let config = parse_config(
+			r#"
+config:
+  database:
+    url: "sqlite::memory:"
+  logging:
+    databaseRetention: 90d
+"#
+			.to_string(),
+			None,
+		)
+		.expect("retention should parse");
+		assert_eq!(
+			config.logging.database_retention,
+			Some(Duration::from_secs(90 * 24 * 3600))
+		);
+
+		let err = parse_config(
+			r#"
+config:
+  database:
+    url: "sqlite::memory:"
+  logging:
+    databaseRetention: 0s
+"#
+			.to_string(),
+			None,
+		)
+		.expect_err("zero retention should fail");
+		assert!(
+			err
+				.to_string()
+				.contains("config.logging.databaseRetention must be greater than zero")
 		);
 	}
 

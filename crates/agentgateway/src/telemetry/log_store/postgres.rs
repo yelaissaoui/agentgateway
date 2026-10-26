@@ -58,6 +58,22 @@ impl PostgresLogStore {
 		Ok(())
 	}
 
+	pub async fn delete_before(&self, before: chrono::DateTime<chrono::Utc>) -> anyhow::Result<u64> {
+		let mut deleted = 0;
+		loop {
+			let rows = sqlx::query(DELETE_LOGS_BEFORE)
+				.bind(before)
+				.bind(DELETE_CHUNK_SIZE)
+				.execute(&self.pool)
+				.await?
+				.rows_affected();
+			deleted += rows;
+			if rows < DELETE_CHUNK_SIZE as u64 {
+				return Ok(deleted);
+			}
+		}
+	}
+
 	pub async fn search(&self, request: SearchRequest) -> anyhow::Result<SearchResponse> {
 		let limit = limit(request.limit);
 		let mut qb = QueryBuilder::<Postgres>::new(format!("{SELECT_LOGS} WHERE 1=1"));
@@ -625,6 +641,14 @@ COPY request_logs (
 
 const COPY_REQUEST_LOG_PAYLOADS: &str = r#"
 COPY request_log_payloads (log_id, request_prompt_json, response_completion_json) FROM STDIN
+"#;
+
+// Small chunks keep each delete short for other gateways writing to the same database.
+const DELETE_CHUNK_SIZE: i64 = 10_000;
+// Payloads are removed by the ON DELETE CASCADE on request_log_payloads.
+const DELETE_LOGS_BEFORE: &str = r#"
+DELETE FROM request_logs
+WHERE id IN (SELECT id FROM request_logs WHERE completed_at < $1 LIMIT $2)
 "#;
 
 const SELECT_LOGS: &str = r#"

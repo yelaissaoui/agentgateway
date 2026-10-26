@@ -1248,6 +1248,14 @@
               "type": "null"
             }
           ]
+        },
+        "databaseRetention": {
+          "description": "How long request logs are kept in the database. Older logs and their payloads are deleted at\nstartup, then every hour. Logs are kept forever when unset.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         }
       },
       "additionalProperties": false

@@ -121,6 +121,22 @@ impl SqliteLogStore {
 		Ok(())
 	}
 
+	pub async fn delete_before(&self, before: chrono::DateTime<chrono::Utc>) -> anyhow::Result<u64> {
+		let mut deleted = 0;
+		loop {
+			let rows = sqlx::query(DELETE_LOGS_BEFORE)
+				.bind(before)
+				.bind(DELETE_CHUNK_SIZE)
+				.execute(&self.pool)
+				.await?
+				.rows_affected();
+			deleted += rows;
+			if rows < DELETE_CHUNK_SIZE as u64 {
+				return Ok(deleted);
+			}
+		}
+	}
+
 	pub async fn search(&self, request: SearchRequest) -> anyhow::Result<SearchResponse> {
 		let limit = limit(request.limit);
 		let mut qb = QueryBuilder::<Sqlite>::new(format!("{SELECT_LOGS} WHERE 1=1"));
@@ -584,6 +600,14 @@ fn sqlite_attr_value(value: String) -> String {
 	}
 }
 
+// Small chunks keep each delete short for other gateways writing to the same database.
+const DELETE_CHUNK_SIZE: i64 = 10_000;
+// Payloads are removed by the ON DELETE CASCADE on request_log_payloads.
+const DELETE_LOGS_BEFORE: &str = r#"
+DELETE FROM request_logs
+WHERE id IN (SELECT id FROM request_logs WHERE completed_at < ? LIMIT ?)
+"#;
+
 const SELECT_LOGS: &str = r#"
 SELECT id, started_at, completed_at, duration_ms, trace_id, span_id, http_status, error,
 	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
@@ -693,6 +717,68 @@ INSERT INTO request_logs VALUES (
 				},
 			])
 		);
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn delete_before_removes_old_logs_and_payloads() -> anyhow::Result<()> {
+		let pool = SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await?;
+		let store = SqliteLogStore::from_pool(pool).await?;
+		let log = |id: &str, completed_at| StoredRequestLog {
+			id: id.into(),
+			started_at: completed_at,
+			completed_at,
+			duration_ms: 1,
+			trace_id: None,
+			span_id: None,
+			http_status: Some(200),
+			error: None,
+			gen_ai_operation_name: None,
+			gen_ai_provider_name: None,
+			gen_ai_request_model: None,
+			gen_ai_response_model: None,
+			input_tokens: None,
+			output_tokens: None,
+			total_tokens: None,
+			cache_read_input_tokens: None,
+			cache_creation_input_tokens: None,
+			reasoning_tokens: None,
+			time_to_first_token_ms: None,
+			time_per_output_token_ms: None,
+			cost: None,
+			agentgateway_user: None,
+			agentgateway_group: None,
+			user_agent_name: None,
+			has_payload: true,
+			attributes_json: "{}".into(),
+			payload: Some(StoredRequestLogPayload {
+				request_prompt_json: Some(json!("hi")),
+				response_completion_json: None,
+			}),
+		};
+		let cutoff = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
+		store
+			.insert_batch(&[
+				log("old", cutoff - chrono::Duration::seconds(1)),
+				log("at-cutoff", cutoff),
+				log("new", cutoff + chrono::Duration::days(1)),
+			])
+			.await?;
+
+		assert_eq!(store.delete_before(cutoff).await?, 1);
+		assert_eq!(store.delete_before(cutoff).await?, 0);
+		let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM request_logs ORDER BY id")
+			.fetch_all(&store.pool)
+			.await?;
+		assert_eq!(ids, ["at-cutoff", "new"]);
+		let payloads: Vec<String> =
+			sqlx::query_scalar("SELECT log_id FROM request_log_payloads ORDER BY log_id")
+				.fetch_all(&store.pool)
+				.await?;
+		assert_eq!(payloads, ["at-cutoff", "new"]);
 		Ok(())
 	}
 }

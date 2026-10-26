@@ -5,7 +5,7 @@ use std::time::Instant;
 use std::{env, thread};
 
 use chrono::{DateTime, Duration, Utc};
-use crossbeam::channel::{Receiver, Sender, TryRecvError};
+use crossbeam::channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -62,16 +62,17 @@ impl RequestLogStore {
 }
 
 pub async fn setup(cfg: &Config) -> anyhow::Result<RequestLogStoreGuard> {
-	setup_with_pool(cfg, None).await
+	setup_with_pool(cfg, None, None).await
 }
 
 pub async fn setup_with_pool(
 	cfg: &Config,
 	pool: Option<crate::database::DatabasePool>,
+	retention: Option<std::time::Duration>,
 ) -> anyhow::Result<RequestLogStoreGuard> {
 	let (tx, rx) = crossbeam::channel::unbounded();
 	let (ready_tx, ready_rx) = oneshot::channel();
-	let writer = LogStoreWorker::new(rx, cfg.clone(), pool, ready_tx)
+	let writer = LogStoreWorker::new(rx, cfg.clone(), pool, retention, ready_tx)
 		.worker_thread("request-log-db-writer".to_string())?;
 	ready_rx
 		.await
@@ -159,6 +160,7 @@ impl Drop for RequestLogStoreGuard {
 // Testing shows this to achieve a pretty good throughput for both postgres and sqlite
 const DEFAULT_LOG_STORE_BATCH_SIZE: usize = 16384;
 const LOG_STORE_BATCH_SIZE_ENV: &str = "REQUEST_LOG_STORE_BATCH_SIZE";
+const LOG_STORE_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 #[allow(clippy::large_enum_variant)] // The StoredRequestLog, which is used 99.9% of the time, is the large one
 enum LogStoreMsg {
@@ -188,6 +190,7 @@ struct LogStoreWorker {
 	receiver: Receiver<LogStoreMsg>,
 	cfg: Config,
 	pool: Option<crate::database::DatabasePool>,
+	retention: Option<std::time::Duration>,
 	ready_tx: Option<oneshot::Sender<anyhow::Result<()>>>,
 }
 
@@ -196,12 +199,14 @@ impl LogStoreWorker {
 		receiver: Receiver<LogStoreMsg>,
 		cfg: Config,
 		pool: Option<crate::database::DatabasePool>,
+		retention: Option<std::time::Duration>,
 		ready_tx: oneshot::Sender<anyhow::Result<()>>,
 	) -> Self {
 		Self {
 			receiver,
 			cfg,
 			pool,
+			retention,
 			ready_tx: Some(ready_tx),
 		}
 	}
@@ -252,15 +257,29 @@ impl LogStoreWorker {
 		};
 		self.notify_ready(Ok(()));
 		let mut batch = Vec::with_capacity(batch_size);
+		let mut next_prune = self.retention.map(|_| Instant::now());
 		loop {
-			match self.receiver.recv() {
+			if let (Some(retention), Some(at)) = (self.retention, next_prune)
+				&& Instant::now() >= at
+			{
+				prune_log_store(&backend, retention).await;
+				next_prune = Some(Instant::now() + LOG_STORE_PRUNE_INTERVAL);
+			}
+			let received = match next_prune {
+				Some(at) => match self.receiver.recv_deadline(at) {
+					Err(RecvTimeoutError::Timeout) => continue,
+					received => received.map_err(|_| ()),
+				},
+				None => self.receiver.recv().map_err(|_| ()),
+			};
+			match received {
 				Ok(msg) => {
 					if process_log_store_msg(&backend, &mut batch, msg).await {
 						self.drain_available_messages(&backend, &mut batch).await;
 						break;
 					}
 				},
-				Err(_) => {
+				Err(()) => {
 					self.drain_available_messages(&backend, &mut batch).await;
 					break;
 				},
@@ -383,6 +402,19 @@ async fn flush_log_store_batch(backend: &Backend, batch: &mut Vec<StoredRequestL
 		"flushed request log database batch"
 	);
 	batch.clear();
+}
+
+async fn prune_log_store(backend: &Backend, retention: std::time::Duration) {
+	let Some(before) = Duration::from_std(retention)
+		.ok()
+		.and_then(|retention| Utc::now().checked_sub_signed(retention))
+	else {
+		return;
+	};
+	match backend.delete_before(before).await {
+		Ok(deleted) => debug!(target: "request", deleted, %before, "pruned request log database"),
+		Err(err) => warn!(target: "request", ?err, "failed to prune request log database"),
+	}
 }
 
 // Keep captured content in its original form until it reaches the database worker.
@@ -963,6 +995,13 @@ impl Backend {
 		match self {
 			Self::Sqlite(store) => store.tail(request).await,
 			Self::Postgres(store) => store.tail(request).await,
+		}
+	}
+
+	async fn delete_before(&self, before: DateTime<Utc>) -> anyhow::Result<u64> {
+		match self {
+			Self::Sqlite(store) => store.delete_before(before).await,
+			Self::Postgres(store) => store.delete_before(before).await,
 		}
 	}
 }
